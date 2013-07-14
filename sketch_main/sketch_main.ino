@@ -1,45 +1,124 @@
 #include <Wire.h>
+#include <Servo.h>
 #include "I2Cdev.h"
-#include <dmpKey.h>
-#include <dmpmap.h>
-#include <inv_mpu.h>
-#include <inv_mpu_dmp_motion_driver.h>
+#include "inv_mpu.h"
+#include "inv_mpu_dmp_motion_driver.h"
+#include "dmpmap.h"
+#include "dmpKey.h"
 #include <MPU6050Lib.h>
-
-// The rate in Hz at which the MPU updates the sensor data and DMP output
-#define MPU_UPDATE_RATE (10)
+#include <QuadController.h>
+#include "aJSON.h"
+#include "PID_v1.h"
 
 MPU6050Lib mpu;
+QuadController quad;
 
-long lastPollTime;   // This is the last time we checked the MPU
-long pollInterval;   // How long between checks (so we don't thrash the I2C bus)
+int ESC_PIN_1 = 13;
+int ESC_PIN_2 = 12;
+int ESC_PIN_3 = 11;
+int ESC_PIN_4 = 10;
+int MPU_VIN_PIN = 8;
 
-boolean duePoll()
-{
-    if ((millis() - lastPollTime) < pollInterval)
-        return false;
-    if (mpu.read())
-    {
-        lastPollTime = millis();
-        return true;
-    }
-    return false;
-}
+aJsonStream serial_stream(&Serial);
+
+long lastHeartbeat;
+long heartbeatTolerance = 1000;  // If no heartbeat for this time then kill the motors
+
+boolean dead = false;
 
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(9600);
   Serial.println("Starting up...");
   Wire.begin();
-  mpu.init(MPU_UPDATE_RATE);
 
-  pollInterval = (1000 / MPU_UPDATE_RATE) - 1;
-  lastPollTime = millis();
+  quad.init(ESC_PIN_1, ESC_PIN_2, ESC_PIN_3, ESC_PIN_4, MPU_VIN_PIN);
+  Serial.println("QuadCopterLoaded");
 }
 
 void loop() {
-    if (duePoll())
+
+  aJsonObject *msg;
+  
+  if (serial_stream.available()) 
+  {
+    // Skip any accidental whitespace
+    serial_stream.skip();
+  }
+
+  if (serial_stream.available())
+  {
+    msg = aJson.parse(&serial_stream);
+    processMessage(msg);
+    aJson.deleteItem(msg);
+  }
+
+  checkHeartbeat();
+
+  quad.loop();
+}
+
+void checkHeartbeat()
+{
+  if ((millis() - lastHeartbeat) > heartbeatTolerance)
+  {
+    // Arrrrrr kill the motors we're dead
+    quad.kill();
+
+    if (!dead)
     {
-        mpu.printQuaternion(mpu.m_rawQuaternion);Serial.print("\n");
-    } 
+      Serial.println("Lost heartbeat!");  
+    }
+
+    dead = true;
+  }
+}
+
+void heartbeat()
+{
+  lastHeartbeat = millis();
+
+  if (dead)
+  {
+    Serial.println("Got heartbeat");
+    quad.enable();
+  }
+
+  dead = false;
+}
+
+void processMessage(aJsonObject *msg)
+{
+  String cmdVal;
+  aJsonObject *val = aJson.getObjectItem(msg, "val");
+  aJsonObject *cmd = aJson.getObjectItem(msg, "cmd");
+
+  if(!cmd)
+  {
+    Serial.println("no command!");
+    // aJson.deleteItem(val);
+    // aJson.deleteItem(cmd);
+    return;
+  }
+
+  cmdVal = String(cmd->valuestring);
+
+  if(cmdVal.equals("heartbeat"))
+  {
+    heartbeat();
+  }
+  else if (cmdVal.equals("force"))
+  {
+    if (val)
+    {
+      quad.setSpeed(val->valueint);
+    }
+  }
+  else if (cmdVal.equals("hover"))
+  {
+    quad.hover();
+  }
+
+  // aJson.deleteItem(val);
+  // aJson.deleteItem(cmd);
 }

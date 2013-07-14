@@ -42,11 +42,19 @@ static inline unsigned short inv_orientation_matrix_to_scalar(const signed char 
     return scalar;
 }
 
-static signed char gyro_orientation[9]= {1, 0, 0,
+static signed char gyro_orientation[9]= {0, 0, -1,
                                          0, 1, 0, 
-                                         0, 0, 1};
+                                         1, 0, 0};
 
-MPU6050Lib::MPU6050Lib() {}
+static MPUQuaternion restAttitude = {0.71f, -0.03f, -0.70f, -0.03f};
+MPUQuaternion rootRotation;
+
+
+MPU6050Lib::MPU6050Lib() 
+{
+    // Calculate the root rotation
+    MPUQuaternionConjugate(restAttitude, rootRotation);
+}
 
 boolean MPU6050Lib::init(int mpuRate)
 {
@@ -110,6 +118,18 @@ boolean MPU6050Lib::init(int mpuRate)
     mpu_set_sample_rate(mpuRate);
 
 #ifdef MPULIB_DEBUG
+    Serial.println('Enabling calibration');
+#endif
+
+//     if (dmp_enable_gyro_cal(1) != 0)
+//     {
+// #ifdef MPULIB_DEBUG
+//         Serial.println('Failed to enable calibration');
+// #endif
+//         return false;
+//     }
+
+#ifdef MPULIB_DEBUG
     Serial.println("finished initializing MPU6050 chip");
 #endif 
 
@@ -123,6 +143,7 @@ boolean MPU6050Lib::read()
     short sensors;
     unsigned char more;
     unsigned long timestamp;
+    MPUQuaternion temp;
 
     mpu_get_int_status(&intStatus);                       // get the current MPU state
     if ((intStatus & (MPU_INT_STATUS_DMP | MPU_INT_STATUS_DMP_0))
@@ -142,20 +163,100 @@ boolean MPU6050Lib::read()
 #endif
         return false;
     }
-
-     // got the raw data - now process
     
-    m_dmpQuaternion[QUAT_W] = (float)m_rawQuaternion[QUAT_W];  // get float version of quaternion
-    m_dmpQuaternion[QUAT_X] = (float)m_rawQuaternion[QUAT_X];
-    m_dmpQuaternion[QUAT_Y] = (float)m_rawQuaternion[QUAT_Y];
-    m_dmpQuaternion[QUAT_Z] = (float)m_rawQuaternion[QUAT_Z];
-    MPUQuaternionNormalize(m_dmpQuaternion);                 // and normalize
+    temp[QUAT_W] = (float)m_rawQuaternion[QUAT_W];  // get float version of quaternion
+    temp[QUAT_X] = (float)m_rawQuaternion[QUAT_X];
+    temp[QUAT_Y] = (float)m_rawQuaternion[QUAT_Y];
+    temp[QUAT_Z] = (float)m_rawQuaternion[QUAT_Z];
+    MPUQuaternionNormalize(temp);                 // and normalize
+
+    MPUQuaternionMultiply(temp, rootRotation, m_dmpQuaternion);
     
     MPUQuaternionQuaternionToEuler(m_dmpQuaternion, m_dmpEulerPose);
 
     return true;
 
 }
+
+boolean MPU6050Lib::init(int mpuRate, int vinPin)
+{
+    pinMode(vinPin, OUTPUT);
+    digitalWrite(vinPin, HIGH);
+    init(mpuRate);
+}
+
+boolean MPU6050Lib::calibrate()
+{
+    long gyro[3];
+    long accel[3];
+    int result;
+    float sens;
+    unsigned short accel_sens;
+
+#ifdef MPULIB_DEBUG
+    Serial.println("Running calibration self test");
+#endif
+    result = mpu_run_self_test(gyro, accel);
+
+    if (result != 0x3)
+    {
+        // We expect the Accel and Gyro cases to pass but they
+        // haven't. We don't trust any of the data.
+#ifdef MPULIB_DEBUG
+        Serial.println("Invalid test data");
+#endif
+        return false;
+    }
+
+    printVector(accel);
+
+    // All good to continue lets push the data onto the DMP
+#ifdef MPULIB_DEBUG
+    Serial.println("Setting biases");
+#endif
+    // Convert the responses into DMP units
+    mpu_get_gyro_sens(&sens);
+    gyro[0] = (long)(gyro[0] * sens);
+    gyro[1] = (long)(gyro[1] * sens);
+    gyro[2] = (long)(gyro[2] * sens);
+    dmp_set_gyro_bias(gyro);
+    mpu_get_accel_sens(&accel_sens);
+
+    Serial.print("accel sens: "); Serial.println(accel_sens);
+    Serial.print("accel bias: "); printVector(accel); Serial.print('\n');
+
+    accel[0] *= accel_sens;
+    accel[1] *= accel_sens;
+    accel[2] *= accel_sens;
+    dmp_set_accel_bias(accel);
+
+#ifdef MPULIB_DEBUG
+    Serial.println("Set biases");
+#endif
+
+    return true;
+}
+
+void MPU6050Lib::calcRotatedVector(float *inVector, float *outVector)
+{
+    // The rotated vector is q x v x q^-1
+    MPUQuaternion conjugate;
+    MPUQuaternion temp;
+    MPUQuaternion vect = {
+        0,
+        inVector[VEC3_X],
+        inVector[VEC3_Y],
+        inVector[VEC3_Z]
+    };
+    MPUQuaternion outQuat;
+    MPUQuaternionConjugate(m_dmpQuaternion, conjugate);
+    MPUQuaternionMultiply(m_dmpQuaternion, vect, temp);
+    MPUQuaternionMultiply(temp, conjugate, outQuat);
+    outVector[VEC3_X] = outQuat[QUAT_X];
+    outVector[VEC3_Y] = outQuat[QUAT_Y];
+    outVector[VEC3_Z] = outQuat[QUAT_Z];
+}
+
 
 void MPU6050Lib::printQuaternion(long *quat)
 {
@@ -181,6 +282,13 @@ void MPU6050Lib::printVector(short *vec)
 }
 
 void MPU6050Lib::printVector(float *vec)
+{
+    Serial.print("x: "); Serial.print(vec[VEC3_X]);  
+    Serial.print(" y: "); Serial.print(vec[VEC3_Y]);  
+    Serial.print(" z: "); Serial.print(vec[VEC3_Z]);    
+}
+
+void MPU6050Lib::printVector(long *vec)
 {
     Serial.print("x: "); Serial.print(vec[VEC3_X]);  
     Serial.print(" y: "); Serial.print(vec[VEC3_Y]);  
